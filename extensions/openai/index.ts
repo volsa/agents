@@ -1,7 +1,5 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-
-const OPENAI_STATUS_SEPARATOR = " ";
+import { CustomEditor, type EditorFactory, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 const FAST_STATE_ENTRY = "openai-fast-mode";
 const REFRESH_EVERY_AGENT_ENDS = 5;
 const STALE_AFTER_MS = 15 * 60 * 1000;
@@ -37,8 +35,12 @@ export default function openAIExtension(pi: ExtensionAPI) {
 	let agentEndsSinceUsageRefresh = 0;
 	let refreshInFlight: Promise<void> | undefined;
 	let footerInstalled = false;
+	let editorInstalled = false;
+	let previousEditorFactory: EditorFactory | undefined;
 	let requestFooterRender: (() => void) | undefined;
-	let openAIStatusLine = "";
+	let requestEditorRender: (() => void) | undefined;
+	let openAILimitsLine = "";
+	let openAIModeLabel = "";
 	let footerCtx: ExtensionContext | undefined;
 
 	function isOpenAISubscription(ctx: ExtensionContext): boolean {
@@ -46,12 +48,19 @@ export default function openAIExtension(pi: ExtensionAPI) {
 	}
 
 	function clearStatus(ctx: ExtensionContext) {
-		openAIStatusLine = "";
+		openAILimitsLine = "";
+		openAIModeLabel = "";
 		requestFooterRender = undefined;
+		requestEditorRender = undefined;
 		footerCtx = undefined;
 		if (footerInstalled) {
 			ctx.ui.setFooter(undefined);
 			footerInstalled = false;
+		}
+		if (editorInstalled) {
+			ctx.ui.setEditorComponent(previousEditorFactory);
+			editorInstalled = false;
+			previousEditorFactory = undefined;
 		}
 	}
 
@@ -62,8 +71,11 @@ export default function openAIExtension(pi: ExtensionAPI) {
 		}
 
 		footerCtx = ctx;
-		openAIStatusLine = [fastEnabled ? "fast" : "slow", formatCurrentLimits()].filter(Boolean).join(OPENAI_STATUS_SEPARATOR);
+		openAIModeLabel = fastEnabled ? "fast" : "normal";
+		openAILimitsLine = formatCurrentLimits();
+		installEditor(ctx);
 		installFooter(ctx);
+		requestEditorRender?.();
 		requestFooterRender?.();
 	}
 
@@ -72,6 +84,18 @@ export default function openAIExtension(pi: ExtensionAPI) {
 		const summary = formatLimitsSummary(latestLimits);
 		const stale = Date.now() - latestLimits.capturedAt > STALE_AFTER_MS;
 		return stale ? `${summary} stale` : summary;
+	}
+
+	function installEditor(ctx: ExtensionContext) {
+		if (editorInstalled) return;
+
+		previousEditorFactory = ctx.ui.getEditorComponent();
+		ctx.ui.setEditorComponent((tui, theme, keybindings) => {
+			const editor = new OpenAIStatusEditor(tui, theme, keybindings, () => openAIModeLabel, ctx.ui.theme.fg.bind(ctx.ui.theme));
+			requestEditorRender = () => tui.requestRender();
+			return editor;
+		});
+		editorInstalled = true;
 	}
 
 	function installFooter(ctx: ExtensionContext) {
@@ -88,7 +112,7 @@ export default function openAIExtension(pi: ExtensionAPI) {
 				},
 				invalidate() {},
 				render(width: number): string[] {
-					return renderCompactFooter(footerCtx ?? ctx, footerData, theme, width, openAIStatusLine, () => pi.getThinkingLevel());
+					return renderCompactFooter(footerCtx ?? ctx, footerData, theme, width, openAILimitsLine, () => pi.getThinkingLevel());
 				},
 			};
 		});
@@ -143,7 +167,10 @@ export default function openAIExtension(pi: ExtensionAPI) {
 		fastEnabled = restoreFastState(ctx, fastEnabled);
 		agentEndsSinceUsageRefresh = 0;
 		footerInstalled = false;
+		editorInstalled = false;
+		previousEditorFactory = undefined;
 		requestFooterRender = undefined;
+		requestEditorRender = undefined;
 		footerCtx = undefined;
 		updateStatus(ctx);
 		if (isOpenAISubscription(ctx)) await refreshUsageLimits(ctx);
@@ -208,7 +235,7 @@ function renderCompactFooter(
 	},
 	theme: { fg(color: string, text: string): string },
 	width: number,
-	openAIStatusLine: string,
+	openAILimitsLine: string,
 	getThinkingLevel: () => string,
 ): string[] {
 	let totalInput = 0;
@@ -242,10 +269,10 @@ function renderCompactFooter(
 
 	const pwdLine = alignStyledLeftRight(
 		pwd,
-		openAIStatusLine,
+		openAILimitsLine,
 		width,
 		(text) => theme.fg("dim", text),
-		(text) => formatOpenAIStatus(text, theme),
+		(text) => theme.fg("dim", text),
 	);
 
 	const statsParts: string[] = [];
@@ -292,12 +319,38 @@ function renderCompactFooter(
 	return [pwdLine, statsLine];
 }
 
-function formatOpenAIStatus(text: string, theme: { fg(color: string, text: string): string }): string {
-	const fastPrefix = "fast";
-	if (text === fastPrefix || text.startsWith(`${fastPrefix} `)) {
-		return theme.fg("text", fastPrefix) + theme.fg("dim", text.slice(fastPrefix.length));
+class OpenAIStatusEditor extends CustomEditor {
+	private readonly dimLabel: (text: string) => string;
+
+	constructor(
+		tui: ConstructorParameters<typeof CustomEditor>[0],
+		theme: ConstructorParameters<typeof CustomEditor>[1],
+		keybindings: ConstructorParameters<typeof CustomEditor>[2],
+		private readonly getLabel: () => string,
+		private readonly fg: (color: string, text: string) => string,
+	) {
+		super(tui, theme, keybindings);
+		this.dimLabel = (text) => this.fg("dim", text);
 	}
-	return theme.fg("dim", text);
+
+	render(width: number): string[] {
+		const lines = super.render(width);
+		const label = this.getLabel();
+		if (!label || lines.length === 0 || width <= 0) return lines;
+
+		const firstLine = stripAnsi(lines[0] ?? "");
+		if (!/^─+$/.test(firstLine)) return lines;
+
+		const prefix = "── ";
+		const suffix = " ";
+		const labelWidth = visibleWidth(label);
+		const remaining = width - visibleWidth(prefix) - labelWidth - visibleWidth(suffix);
+		if (remaining < 1) return lines;
+
+		const styledLabel = label === "fast" ? this.fg("warning", label) : this.dimLabel(label);
+		lines[0] = this.borderColor(prefix) + styledLabel + this.borderColor(suffix + "─".repeat(remaining));
+		return lines;
+	}
 }
 
 function alignStyledLeftRight(
