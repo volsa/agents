@@ -7,9 +7,10 @@ OpenAI subscription helpers for pi.
 - `/fast` toggles OpenAI Fast mode on/off; Fast mode starts enabled by default.
 - Fast mode only applies to `openai-codex` models authenticated through an OpenAI/ChatGPT subscription.
 - When enabled, provider payloads get `service_tier: "priority"`.
-- Compact footer shows `fast` / `slow` and usage limits such as `5h: 55% (~2h), 7d: 70% (~3d)` on the first footer line; only `fast` is highlighted white.
+- Compact footer shows `fast` / `slow`, usage limits, and subscription time remaining, such as `5h: 55% (~2h), 7d: 70% (~3d), expires in ~12d`, on the first footer line; only `fast` is highlighted white.
+- Subscription expiration comes primarily from the entitlement returned by ChatGPT's undocumented `/backend-api/accounts/check/v4-2023-04-27` endpoint, with `/backend-api/subscriptions` as a fallback. If both requests fail or neither response has a recognized expiration timestamp, the footer shows `expiration API failed` in red.
 - OpenAI footer is hidden automatically when switching to non-OpenAI subscription providers.
-- Usage limits refresh on OpenAI session/model activation and then every 5 completed agent turns.
+- Usage limits and subscription expiration refresh on OpenAI session/model activation and asynchronously whenever the user submits a message, without delaying agent processing.
 
 ## Reference
 

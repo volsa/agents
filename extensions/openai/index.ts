@@ -1,8 +1,8 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { CustomEditor, type EditorFactory, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 const FAST_STATE_ENTRY = "openai-fast-mode";
-const REFRESH_EVERY_AGENT_ENDS = 5;
 const STALE_AFTER_MS = 15 * 60 * 1000;
+const EXPIRATION_API_FAILURE_LABEL = "expiration API failed";
 
 type UsageWindow = {
 	usedPercent: number;
@@ -13,8 +13,13 @@ type UsageWindow = {
 type UsageLimits = {
 	primary?: UsageWindow;
 	secondary?: UsageWindow;
+	subscriptionExpiration?: SubscriptionExpiration;
 	capturedAt: number;
 };
+
+type SubscriptionExpiration =
+	| { status: "available"; expiresAt: number }
+	| { status: "failed" };
 
 type UsagePayload = {
 	rate_limit?: {
@@ -32,7 +37,6 @@ type RateLimitWindowPayload = {
 export default function openAIExtension(pi: ExtensionAPI) {
 	let fastEnabled = true;
 	let latestLimits: UsageLimits | undefined;
-	let agentEndsSinceUsageRefresh = 0;
 	let refreshInFlight: Promise<void> | undefined;
 	let footerInstalled = false;
 	let editorInstalled = false;
@@ -83,7 +87,9 @@ export default function openAIExtension(pi: ExtensionAPI) {
 		if (!latestLimits) return "limits:?";
 		const summary = formatLimitsSummary(latestLimits);
 		const stale = Date.now() - latestLimits.capturedAt > STALE_AFTER_MS;
-		return stale ? `${summary} stale` : summary;
+		const limitsSummary = stale ? `${summary} stale` : summary;
+		const expirationSummary = formatSubscriptionExpiration(latestLimits.subscriptionExpiration);
+		return expirationSummary ? `${limitsSummary}, ${expirationSummary}` : limitsSummary;
 	}
 
 	function installEditor(ctx: ExtensionContext) {
@@ -130,15 +136,19 @@ export default function openAIExtension(pi: ExtensionAPI) {
 		refreshInFlight = (async () => {
 			try {
 				const limits = await fetchUsageLimits(ctx);
-				if (limits.primary || limits.secondary) {
+				if (limits.primary || limits.secondary || !latestLimits) {
 					latestLimits = limits;
+				} else {
+					latestLimits = {
+						...latestLimits,
+						subscriptionExpiration: limits.subscriptionExpiration,
+						capturedAt: limits.capturedAt,
+					};
 				}
 			} catch (error) {
-				// Keep the last known limits and avoid retry storms. The next retry happens
-				// after another REFRESH_EVERY_AGENT_ENDS completed agent turns.
+				// Keep the last known limits. The next user message will retry.
 				console.warn(`[openai] Failed to refresh usage limits: ${String(error)}`);
 			} finally {
-				agentEndsSinceUsageRefresh = 0;
 				updateStatus(ctx);
 				refreshInFlight = undefined;
 			}
@@ -165,7 +175,6 @@ export default function openAIExtension(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		fastEnabled = restoreFastState(ctx, fastEnabled);
-		agentEndsSinceUsageRefresh = 0;
 		footerInstalled = false;
 		editorInstalled = false;
 		previousEditorFactory = undefined;
@@ -177,7 +186,6 @@ export default function openAIExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("model_select", async (_event, ctx) => {
-		agentEndsSinceUsageRefresh = 0;
 		updateStatus(ctx);
 		if (isOpenAISubscription(ctx)) {
 			await refreshUsageLimits(ctx);
@@ -186,19 +194,11 @@ export default function openAIExtension(pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("agent_end", async (_event, ctx) => {
-		if (!isOpenAISubscription(ctx)) {
-			agentEndsSinceUsageRefresh = 0;
-			clearStatus(ctx);
-			return;
-		}
-
-		agentEndsSinceUsageRefresh += 1;
-		updateStatus(ctx);
-
-		if (agentEndsSinceUsageRefresh >= REFRESH_EVERY_AGENT_ENDS) {
-			await refreshUsageLimits(ctx);
-		}
+	pi.on("input", (event, ctx) => {
+		// Poll for each user-submitted message without delaying agent processing.
+		// Extension-injected messages are not direct user submissions.
+		if (event.source === "extension" || !isOpenAISubscription(ctx)) return;
+		void refreshUsageLimits(ctx);
 	});
 
 	pi.on("before_provider_request", (event, ctx) => {
@@ -216,8 +216,10 @@ export default function openAIExtension(pi: ExtensionAPI) {
 
 		const limits = parseRateLimitHeaders(event.headers);
 		if (limits.primary || limits.secondary) {
-			latestLimits = limits;
-			agentEndsSinceUsageRefresh = 0;
+			latestLimits = {
+				...limits,
+				subscriptionExpiration: latestLimits?.subscriptionExpiration,
+			};
 			updateStatus(ctx);
 		}
 	});
@@ -272,7 +274,7 @@ function renderCompactFooter(
 		openAILimitsLine,
 		width,
 		(text) => theme.fg("dim", text),
-		(text) => theme.fg("dim", text),
+		(text) => styleOpenAILimitsLine(text, theme),
 	);
 
 	const statsParts: string[] = [];
@@ -351,6 +353,16 @@ class OpenAIStatusEditor extends CustomEditor {
 		lines[0] = this.borderColor(prefix) + styledLabel + this.borderColor(suffix + "─".repeat(remaining));
 		return lines;
 	}
+}
+
+function styleOpenAILimitsLine(text: string, theme: { fg(color: string, text: string): string }): string {
+	const failureIndex = text.indexOf(EXPIRATION_API_FAILURE_LABEL);
+	if (failureIndex === -1) return theme.fg("dim", text);
+
+	const before = text.slice(0, failureIndex);
+	const failure = text.slice(failureIndex, failureIndex + EXPIRATION_API_FAILURE_LABEL.length);
+	const after = text.slice(failureIndex + EXPIRATION_API_FAILURE_LABEL.length);
+	return theme.fg("dim", before) + theme.fg("error", failure) + theme.fg("dim", after);
 }
 
 function alignStyledLeftRight(
@@ -447,26 +459,81 @@ async function fetchUsageLimits(ctx: ExtensionContext): Promise<UsageLimits> {
 	const baseUrl = normalizeCodexBackendBaseUrl(
 		typeof model.baseUrl === "string" && model.baseUrl.trim() ? model.baseUrl.trim() : "https://chatgpt.com/backend-api",
 	);
-	const url = `${baseUrl}/wham/usage`;
+	const headers = {
+		...auth.headers,
+		Authorization: `Bearer ${auth.apiKey}`,
+		"chatgpt-account-id": accountId,
+		originator: "pi",
+		"User-Agent": "pi",
+	};
+	const usageUrl = `${baseUrl}/wham/usage`;
+	const expirationPromise = fetchSubscriptionExpiration(baseUrl, accountId, headers, ctx.signal).catch((error) => {
+		console.warn(`[openai] Failed to refresh subscription expiration: ${String(error)}`);
+		return { status: "failed" } as const;
+	});
 
-	const response = await fetch(url, {
+	const response = await fetch(usageUrl, {
 		method: "GET",
-		headers: {
-			...auth.headers,
-			Authorization: `Bearer ${auth.apiKey}`,
-			"chatgpt-account-id": accountId,
-			originator: "pi",
-			"User-Agent": "pi",
-		},
+		headers,
 		signal: ctx.signal,
 	});
 
 	if (!response.ok) {
-		throw new Error(`GET ${url} failed: ${response.status} ${response.statusText}`);
+		throw new Error(`GET ${usageUrl} failed: ${response.status} ${response.statusText}`);
 	}
 
 	const payload = (await response.json()) as UsagePayload;
-	return parseUsagePayload(payload);
+	return {
+		...parseUsagePayload(payload),
+		subscriptionExpiration: await expirationPromise,
+	};
+}
+
+async function fetchSubscriptionExpiration(
+	baseUrl: string,
+	accountId: string,
+	headers: Record<string, string>,
+	signal: AbortSignal | undefined,
+): Promise<SubscriptionExpiration> {
+	// The subscriptions endpoint used by ChatGPT's billing UI may reject Codex
+	// OAuth tokens. Codex itself uses the versioned accounts/check endpoint, whose
+	// entitlement payload also includes the current plan's expiration timestamp.
+	const endpoints = [
+		{
+			label: "accounts/check",
+			url: `${baseUrl}/accounts/check/v4-2023-04-27`,
+		},
+		{
+			label: "subscriptions",
+			url: `${baseUrl}/subscriptions?account_id=${encodeURIComponent(accountId)}`,
+		},
+	];
+	const failures: string[] = [];
+
+	for (const endpoint of endpoints) {
+		try {
+			const response = await fetch(endpoint.url, {
+				method: "GET",
+				headers,
+				signal,
+			});
+
+			if (!response.ok) {
+				failures.push(`${endpoint.label}: HTTP ${response.status}`);
+				continue;
+			}
+
+			const payload = (await response.json()) as unknown;
+			const expiresAt = parseSubscriptionExpirationPayload(payload, accountId);
+			if (expiresAt !== undefined) return { status: "available", expiresAt };
+			failures.push(`${endpoint.label}: expiration timestamp missing`);
+		} catch (error) {
+			if (signal?.aborted) throw error;
+			failures.push(`${endpoint.label}: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+
+	throw new Error(failures.join("; "));
 }
 
 function normalizeCodexBackendBaseUrl(baseUrl: string): string {
@@ -539,6 +606,102 @@ function parseRateLimitHeaders(headers: Record<string, string>): UsageLimits {
 		secondary: parseHeaderWindow("x-codex-secondary"),
 		capturedAt: Date.now(),
 	};
+}
+
+function formatSubscriptionExpiration(expiration: SubscriptionExpiration | undefined): string | undefined {
+	if (!expiration) return undefined;
+	if (expiration.status === "failed") return EXPIRATION_API_FAILURE_LABEL;
+
+	const remaining = formatResetIn(expiration.expiresAt);
+	return remaining === "now" ? "expired" : `expires in ${remaining ?? "?"}`;
+}
+
+function parseSubscriptionExpirationPayload(payload: unknown, accountId?: string): number | undefined {
+	const scopedPayload = findAccountPayload(payload, accountId) ?? payload;
+	const fieldPriority = new Map(
+		[
+			"subscriptionexpiresattimestamp",
+			"subscriptionexpiresat",
+			"currentperiodend",
+			"billingperiodend",
+			"periodend",
+			"renewalat",
+			"renewaldate",
+			"renewsat",
+			"nextbillingdate",
+			"activeuntil",
+			"expiresat",
+		].map((field, index) => [field, index]),
+	);
+	const candidates: Array<{ timestamp: number; priority: number }> = [];
+	const seen = new Set<object>();
+
+	const visit = (value: unknown, depth: number) => {
+		if (depth > 8 || value === null || typeof value !== "object") return;
+		if (seen.has(value)) return;
+		seen.add(value);
+
+		if (Array.isArray(value)) {
+			for (const item of value) visit(item, depth + 1);
+			return;
+		}
+
+		for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+			const normalizedKey = key.toLowerCase().replace(/[^a-z0-9]/g, "");
+			const priority = fieldPriority.get(normalizedKey);
+			if (priority !== undefined) {
+				const timestamp = parseTimestampSeconds(child);
+				if (timestamp !== undefined) candidates.push({ timestamp, priority });
+			}
+			visit(child, depth + 1);
+		}
+	};
+
+	visit(scopedPayload, 0);
+	if (candidates.length === 0) return undefined;
+
+	const bestPriority = Math.min(...candidates.map((candidate) => candidate.priority));
+	const preferred = candidates.filter((candidate) => candidate.priority === bestPriority).map((candidate) => candidate.timestamp);
+	const now = Date.now() / 1000;
+	const future = preferred.filter((timestamp) => timestamp > now).sort((a, b) => a - b);
+	if (future.length > 0) return future[0];
+	return preferred.sort((a, b) => b - a)[0];
+}
+
+function findAccountPayload(payload: unknown, accountId: string | undefined): unknown {
+	if (!accountId || payload === null || typeof payload !== "object" || Array.isArray(payload)) return undefined;
+	const accounts = (payload as Record<string, unknown>).accounts;
+	if (accounts === null || typeof accounts !== "object" || Array.isArray(accounts)) return undefined;
+
+	for (const value of Object.values(accounts as Record<string, unknown>)) {
+		if (value === null || typeof value !== "object" || Array.isArray(value)) continue;
+		const record = value as Record<string, unknown>;
+		const account = record.account;
+		if (account && typeof account === "object" && !Array.isArray(account)) {
+			const id = (account as Record<string, unknown>).account_id;
+			if (id === accountId) return record;
+		}
+	}
+
+	return undefined;
+}
+
+function parseTimestampSeconds(value: unknown): number | undefined {
+	let timestamp: number;
+	if (typeof value === "number") {
+		timestamp = value;
+	} else if (typeof value === "string") {
+		const trimmed = value.trim();
+		if (!trimmed) return undefined;
+		const numeric = Number(trimmed);
+		timestamp = Number.isFinite(numeric) ? numeric : Date.parse(trimmed) / 1000;
+	} else {
+		return undefined;
+	}
+
+	if (!Number.isFinite(timestamp) || timestamp <= 0) return undefined;
+	if (timestamp > 100_000_000_000) timestamp /= 1000;
+	return Number.isFinite(timestamp) ? timestamp : undefined;
 }
 
 function formatLimitsSummary(limits: UsageLimits): string {
