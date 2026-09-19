@@ -1,69 +1,50 @@
 ---
 name: exa-search
-description: Search the web with Exa when current, external, or uncertain information would help; useful for coding research and general questions.
+description: Search the live web with Exa and return ranked sources, relevant excerpts, full text, or grounded synthesized answers. Use for current facts, web research, documentation, news, papers, companies, and people.
+compatibility: Requires Node.js 18+ and EXA_API_KEY in the environment.
 ---
 
 # Exa Search
 
-Use this skill when current web information, external docs, source-backed clarification, recent releases, API behavior, bugs, pricing, benchmarks, or general factual lookup would improve the answer.
-
-Prefer local repository inspection for questions answerable from workspace files. Do not search when the user asks not to.
-
-## Command
-
-Run the helper from this skill directory:
+Run commands from this skill's directory. The CLI prints JSON to stdout and actionable failures to stderr.
 
 ```bash
-./exa-search.mjs "query" --purpose "why this search is needed"
+node scripts/exa-search.mjs --highlights "natural-language query"
 ```
 
-Useful options:
+## Choose options
+
+Start with `--highlights`: it returns query-relevant evidence with low context usage.
+
+- Search mode: omit `--type`/use `auto` normally; `fast` for interactive latency; `instant` for autocomplete/voice; `deep-lite` for brief research; `deep` for iterative multi-source research; `deep-reasoning` only when difficult conflicting evidence needs extra reasoning.
+- Content: use `--highlights` normally. Use `--text --text-max-chars N` only when broader page context is necessary. Do not request both unless both views are genuinely needed.
+- Scope: `-n N` controls result count. Add repeatable `--include-domain`/`--exclude-domain` only for hard constraints. Use `--start-published`/`--end-published` for publication windows, not page freshness.
+- Freshness: `--max-age-hours 0` forces fresh page content, `-1` uses cache only, and a positive value accepts cache up to that age.
+- Deep: repeat `--additional-query` only for distinct subtopics and only with a deep mode.
+- Synthesis: `--output-text "format instructions"` requests a grounded prose answer. For structured output, put the complete Exa `outputSchema` in a file and use `--output-schema FILE`; prefer `--type deep` for complex/multi-item output.
+- `--system-prompt` guides source preferences, novelty, or deduplication; it does not replace the search query.
+- Use `--stream` only with an output schema when incremental SSE output is useful.
+
+Examples:
 
 ```bash
-./exa-search.mjs "query" --type auto --num 5
-./exa-search.mjs "query" --fresh              # force livecrawl: contents.maxAgeHours=0
-./exa-search.mjs "query" --text --max-chars 12000
-./exa-search.mjs "query" --deep               # type=deep
-./exa-search.mjs "query" --domains react.dev,nodejs.org
-./exa-search.mjs "query" --category news
-./exa-search.mjs "query" --json
+node scripts/exa-search.mjs --type fast -n 5 --highlights "latest Node.js security releases"
+node scripts/exa-search.mjs --type deep --highlights \
+  --additional-query "vendor documentation" --additional-query "independent benchmarks" \
+  "compare current vector databases for hybrid retrieval"
+node scripts/exa-search.mjs --type deep --output-text "Answer in five bullets with key disagreements" \
+  "How do recent studies assess AI coding assistant productivity?"
+node scripts/exa-search.mjs --include-domain docs.exa.ai --text --text-max-chars 8000 \
+  "Search API outputSchema documentation"
 ```
 
-## Defaults
-
-- Default search type: `auto`.
-- Default content mode: `contents.highlights: true`.
-- Use `fast`/`instant` for latency-sensitive lookups.
-- Use `deep-lite`, `deep`, or `deep-reasoning` for complex multi-source research or synthesis.
-- Use `--text` only when full context is needed.
-- Use `--fresh` only when cached content is unacceptable.
-
-## Requirements
-
-- Requires `EXA_API_KEY` in the environment. The helper tries `~/.zshrc` via `zsh` if the variable is missing.
-- Uses Node.js with built-in `fetch` and ESM support.
-
-## Workflow
-
-1. Turn the need into a concise, source-seeking query.
-2. Prefer official/primary sources for engineering questions; use `--domains` when useful.
-3. Start with default `auto` + highlights; escalate only as needed.
-4. Use the returned sources to answer; preserve important URLs.
-5. If sources disagree, say so.
-6. If search fails because `EXA_API_KEY` is missing or invalid, keep working without Exa; avoid further Exa calls for that task, and end the response with a bold notice that Exa search failed. Highlight message in bold style.
-
-## Docs refresh
-
-If Exa behavior may have changed, refresh docs as markdown:
+For uncommon Search API fields, write a complete request JSON and run:
 
 ```bash
-curl -L -H "Accept: text/markdown" 'https://exa.ai/docs/reference/search-api-guide-for-coding-agents'
-curl -L -H "Accept: text/markdown" 'https://exa.ai/docs/reference/search-best-practices'
-curl -L -H "Accept: text/markdown" 'https://exa.ai/docs/llms.txt'
+node scripts/exa-search.mjs --request-file request.json
+# or: printf '%s' "$json" | node scripts/exa-search.mjs --request-file -
 ```
 
-## Gotchas
+This passthrough supports every field accepted by `POST /search`. See [the option reference](references/search-api.md) before using uncommon fields. Never expose `EXA_API_KEY` or place it in arguments/files.
 
-- Nest `highlights`, `text`, and `summary` under `contents`.
-- Do not use deprecated `useAutoprompt`, top-level `text`, or top-level `highlights`.
-- Use `includeDomains` / `excludeDomains`, not URL filters.
+If the command fails, report its error explicitly. Do not claim a search succeeded and do not silently switch to another source. A missing environment key, rejected/invalid key, exhausted credits, budget limit, bad request, rate limit, service error, timeout, and network failure are distinguished by the CLI.

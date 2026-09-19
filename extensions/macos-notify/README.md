@@ -1,9 +1,20 @@
-# macOS Notify
+# Ghostty Notify
 
-Sends a native macOS notification when Pi finishes an agent turn while the terminal is unfocused.
+Sends a native Ghostty notification when Pi has fully settled and is waiting for input.
 
-- Enables terminal focus reporting for Pi UI sessions on macOS.
-- Debounces notifications to avoid spam.
-- Uses OSC 777 notifications where supported, with AppleScript fallback.
-- Configure sound with `PI_MACOS_NOTIFY_SOUND` (default: `Glass`, use `none` to disable).
-- Force transport with `PI_MACOS_NOTIFY_TRANSPORT=osc777` or `osascript`.
+The extension always emits an OSC 777 notification. Ghostty decides whether to display it:
+
+- The current Ghostty surface is focused: suppressed.
+- Another split, tab, or Ghostty window is focused: displayed.
+- Another application is focused: displayed.
+
+This intentionally relies on Ghostty's surface-level focus handling rather than terminal focus-reporting sequences, which only describe application/window focus and cannot reliably distinguish splits.
+
+## Requirements
+
+- macOS
+- Ghostty
+- Pi running in interactive TUI mode
+- Ghostty desktop notifications enabled (the default)
+
+After installing or changing the extension, run `/reload` in Pi.

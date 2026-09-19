@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 
-# Register this repo as a local Pi package so Pi loads its skills/ and extensions/ directories from here.
-pi install "$PWD"
+REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
-# Symlink this repo's skills into ~/.claude so Claude Code picks them up too.
+# Register this repo as a local Pi package so Pi loads its skills/ and extensions/ directories from here.
+pi install "$REPO_DIR"
+
+# Symlink for other harnesses as well
+mkdir -p "$HOME/.agents"
 mkdir -p "$HOME/.claude"
-ln -sfn "$PWD/skills" "$HOME/.claude/skills"
+
+ln -sfn "$REPO_DIR/skills" "$HOME/.agents/skills"
+ln -sfn "$REPO_DIR/skills" "$HOME/.claude/skills"
